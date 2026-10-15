@@ -9,6 +9,8 @@ const ROOT = __dirname;
 const HOST = process.env.SEESTAR_HOST || '192.168.8.24';
 const KEY_PATH = process.env.SEESTAR_KEY_PATH || path.join(ROOT, '..', 'seestar-cli', 'seestar.pem');
 const PORT = Number(process.env.PORT || 8787);
+const ALPACA_PORT = Number(process.env.SEESTAR_ALPACA_PORT || 32323);
+const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
 function contentType(file) {
   return file.endsWith('.html') ? 'text/html; charset=utf-8' : file.endsWith('.js') ? 'text/javascript; charset=utf-8' : file.endsWith('.css') ? 'text/css; charset=utf-8' : 'application/octet-stream';
@@ -16,11 +18,27 @@ function contentType(file) {
 
 class Scope {
   constructor() { this.key = fs.readFileSync(KEY_PATH); this.id = 1; this.buffer = ''; this.waiters = new Map(); }
+  fail(error) {
+    for (const waiter of this.waiters.values()) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    this.waiters.clear();
+  }
   async open() {
     this.socket = net.createConnection({ host: HOST, port: 4700 });
+    this.socket.setKeepAlive(true, 10000);
     this.socket.setTimeout(15000);
     this.socket.on('data', data => this.receive(data));
-    await new Promise((resolve, reject) => { this.socket.once('connect', resolve); this.socket.once('error', reject); this.socket.once('timeout', () => reject(new Error('Scope connection timed out.'))); });
+    this.socket.on('error', error => this.fail(error));
+    this.socket.on('close', () => this.fail(new Error('Scope connection closed.')));
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (callback, value) => { if (!settled) { settled = true; callback(value); } };
+      this.socket.once('connect', () => finish(resolve));
+      this.socket.once('error', error => finish(reject, error));
+      this.socket.once('timeout', () => finish(reject, new Error('Scope connection timed out.')));
+    });
     await this.auth();
   }
   receive(data) {
@@ -29,14 +47,18 @@ class Scope {
     while ((n = this.buffer.indexOf('\n')) >= 0) {
       const line = this.buffer.slice(0, n).trim(); this.buffer = this.buffer.slice(n + 1);
       if (!line) continue;
-      try { const message = JSON.parse(line); const waiter = this.waiters.get(message.id); if (waiter) { this.waiters.delete(message.id); waiter(message); } } catch { /* ignore telemetry fragments */ }
+      try {
+        const message = JSON.parse(line); const waiter = this.waiters.get(message.id);
+        if (waiter) { this.waiters.delete(message.id); clearTimeout(waiter.timer); waiter.resolve(message); }
+      } catch { /* ignore telemetry fragments */ }
     }
   }
   request(method, params, verify = true) {
     const id = this.id++; const payload = { id, method }; if (verify) payload.verify = true; if (params !== undefined) payload.params = params;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.waiters.delete(id); reject(new Error(`No reply for ${method}.`)); }, 15000);
-      this.waiters.set(id, message => { clearTimeout(timer); resolve(message); });
+      this.waiters.set(id, { resolve, reject, timer });
+      if (!this.socket?.writable) { clearTimeout(timer); this.waiters.delete(id); reject(new Error('Scope connection is not writable.')); return; }
       this.socket.write(JSON.stringify(payload) + '\r\n');
     });
   }
@@ -58,9 +80,62 @@ async function call(method, params) {
   finally { scope.close(); }
 }
 
-function safeStatus(device, app) {
+function alpacaHealth() {
+  return new Promise((resolve, reject) => {
+    const request = http.get({
+      host: HOST,
+      port: ALPACA_PORT,
+      path: '/management/v1/description?ClientID=1&ClientTransactionID=1',
+      timeout: 3_000,
+    }, response => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => { body += chunk; });
+      response.on('end', () => {
+        try {
+          const payload = JSON.parse(body);
+          if (response.statusCode !== 200 || payload.ErrorNumber) throw new Error(payload.ErrorMessage || `Alpaca returned HTTP ${response.statusCode}.`);
+          resolve({ online: true, server: payload.Value?.ServerName, version: payload.Value?.ManufacturerVersion });
+        } catch (error) { reject(error); }
+      });
+    });
+    request.on('timeout', () => request.destroy(new Error('Alpaca health check timed out.')));
+    request.on('error', reject);
+  });
+}
+
+async function readStatus() {
+  const alpaca = alpacaHealth().catch(error => ({ online: false, error: error.message }));
+  let lastError;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const scope = new Scope();
+    try {
+      await scope.open();
+      // Keep a status refresh to one authenticated connection. The older version
+      // opened two parallel sessions every time the dashboard refreshed.
+      const device = await scope.request('get_device_state');
+      const app = await scope.request('iscope_get_app_state');
+      if (device.code !== 0 || app.code !== 0) throw new Error(device.error || app.error || 'Scope rejected a status request.');
+      return { device: device.result, app: app.result, alpaca: await alpaca, rpcError: null };
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) await pause(750);
+    } finally {
+      scope.close();
+    }
+  }
+  const alpacaStatus = await alpaca;
+  if (alpacaStatus.online) return { device: null, app: null, alpaca: alpacaStatus, rpcError: lastError?.message || 'Native control connection failed.' };
+  throw lastError;
+}
+
+function safeStatus(device, app, alpaca, rpcError) {
   const d = device || {}; const p = d.pi_status || {}; const view = app?.View || {};
   return {
+    connection: {
+      native: { online: !rpcError, error: rpcError || undefined },
+      alpaca: alpaca || { online: false, error: 'Alpaca was not checked.' },
+    },
     device: { model: d.device?.product_model, firmware: d.device?.firmware_ver_string },
     power: { battery: p.battery_capacity, charging: p.charge_online, temperature: p.temp, overtemp: p.is_overtemp },
     storage: d.storage?.storage_volume?.[0],
@@ -72,8 +147,8 @@ function safeStatus(device, app) {
 async function handler(req, res) {
   try {
     if (req.method === 'GET' && req.url === '/api/status') {
-      const [device, app] = await Promise.all([call('get_device_state'), call('iscope_get_app_state')]);
-      return json(res, 200, safeStatus(device, app));
+      const { device, app, alpaca, rpcError } = await readStatus();
+      return json(res, 200, safeStatus(device, app, alpaca, rpcError));
     }
     if (req.method === 'POST' && req.url === '/api/action') {
       let raw = ''; for await (const chunk of req) raw += chunk; const body = JSON.parse(raw || '{}');
